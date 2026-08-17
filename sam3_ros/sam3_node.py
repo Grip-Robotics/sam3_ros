@@ -372,14 +372,36 @@ class Sam3Node(LifecycleNode):
             res = results[0]
             if res.masks is None:
                 continue
+            if res.boxes is None or res.boxes.conf is None:
+                self.get_logger().warn(
+                    f"SAM3 returned masks without confidence scores for '{class_name}'",
+                    throttle_duration_sec=10.0,
+                )
+                continue
+            if len(res.masks.data) != len(res.boxes.conf):
+                self.get_logger().warn(
+                    f"SAM3 returned {len(res.masks.data)} masks but "
+                    f"{len(res.boxes.conf)} scores for '{class_name}'",
+                    throttle_duration_sec=10.0,
+                )
+                continue
 
             color = self.get_color_for_class(class_name)
 
-            for mask in res.masks.data:
+            for mask, score in zip(res.masks.data, res.boxes.conf):
 
                 mask_np = mask.cpu().numpy().astype(bool)
                 if not mask_np.any():
                     continue
+
+                confidence = float(score.detach().cpu().item())
+                if not np.isfinite(confidence):
+                    self.get_logger().warn(
+                        f"SAM3 returned a non-finite score for '{class_name}'",
+                        throttle_duration_sec=10.0,
+                    )
+                    continue
+                confidence = float(np.clip(confidence, 0.0, 1.0))
 
                 ys, xs = np.where(mask_np)
                 x, y, w, h = cv2.boundingRect(np.column_stack((xs, ys)))
@@ -399,7 +421,7 @@ class Sam3Node(LifecycleNode):
 
                     ohwp_mask = ObjectHypothesisWithPose()
                     ohwp_mask.hypothesis.class_id = class_name
-                    ohwp_mask.hypothesis.score = 1.0
+                    ohwp_mask.hypothesis.score = confidence
                     mask_msg.results.append(ohwp_mask)
                     mask_array.masks.append(mask_msg)
 
@@ -415,6 +437,7 @@ class Sam3Node(LifecycleNode):
                 ohwp = ObjectHypothesisWithPose()
                 det2d.results.append(ohwp)
                 ohwp.hypothesis.class_id = class_name
+                ohwp.hypothesis.score = confidence
 
                 ohwp.pose.pose.position = Point(
                     x=det2d.bbox.center.position.x,
@@ -435,7 +458,7 @@ class Sam3Node(LifecycleNode):
                 y2 = int(y + h)
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
 
-                label = f"{class_name} #{instance_id}"
+                label = f"{class_name} #{instance_id} {confidence:.2f}"
                 cv2.putText(
                     overlay,
                     label,
